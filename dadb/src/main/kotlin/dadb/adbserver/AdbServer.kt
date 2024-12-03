@@ -1,6 +1,5 @@
 package dadb.adbserver
 
-import dadb.AdbConnection
 import dadb.AdbStream
 import dadb.Dadb
 import okio.buffer
@@ -19,10 +18,19 @@ object AdbServer {
      *
      * Possible deviceQuery values:
      *
-     * host:transport:<serial-number>
+     * host-serial:<serial-id>
+     *     This is a special form of query, where the 'host-serial::'
+     *     prefix can be used to indicate that the client is asking the ADB server
+     *     for information related to a specific device. can include a :port suffix
+     *     for 'adb connect' devices.
+     *     This survives devices being reconnected.
+     *
+     * host:transport:<transport-id>
      *     Ask to switch the connection to the device/emulator identified by
-     *     <serial-number>. After the OKAY response, every client request will
-     *     be sent directly to the adbd daemon running on the device.
+     *     <transport-id> in 'adb -devices -l'. After the OKAY response, every
+     *     client request will be sent directly to the adbd daemon running on the
+     *     device.
+     *     Risky: if the device is briefly unplugged, its transport_id will change.
      *     (Used to implement the -s option)
      *
      * host:transport-usb
@@ -48,11 +56,13 @@ object AdbServer {
         adbServerPort: Int = 5037,
         deviceQuery: String = "host:transport-any",
         connectTimeout: Int = 0,
-        socketTimeout: Int = 0
+        socketTimeout: Int = 0,
+        serial: String? = null,
     ): Dadb {
-        val name = deviceQuery
+        val name = serial ?: deviceQuery
             .removePrefix("host:") // Use the device query without the host: prefix
-            .removePrefix("transport:") // If it's a serial-number, just show that
+            .removePrefix("host-serial:") // Present the serial
+            .removePrefix("transport:") // If it's a transport-id, just show that
         return AdbServerDadb(adbServerHost, adbServerPort, deviceQuery, name, connectTimeout, socketTimeout)
     }
 
@@ -69,20 +79,23 @@ object AdbServer {
             return emptyList()
         }
         val output = Socket(adbServerHost, adbServerPort).use { socket ->
-            send(socket, "host:devices")
+            send(socket, "host:devices-l") // devices-l for transport-id:
             readString(DataInputStream(socket.getInputStream()))
         }
         return output.lines()
             .filter { it.isNotBlank() }
-            .mapNotNull {
-                val parts = it.split("\t")
-                if (parts.size != 2) {
-                    null
-                } else {
-                    parts[0]
-                }
+            .mapNotNull { line ->
+                // 59652cce               device usb:34603008X product:NE2213EEA model:NE2213 device:OP516FL1 transport_id:5
+                val parts = line.split(Regex("\\s+"))
+                val transportId = parts
+                    .firstOrNull { it.startsWith("transport_id:") }
+                    ?.removePrefix("transport_id:")
+                    ?.toInt()
+                if ( transportId == null ) null else parts[0] to transportId
             }
-            .map { createDadb(adbServerHost, adbServerPort, "host:transport:${it}") }
+            .map { createDadb(adbServerHost, adbServerPort, "host:transport-id:${it.second}", serial = it.first) }
+//            .map { createDadb(adbServerHost, adbServerPort, "host:transport:${it}") }
+//            .map { createDadb(adbServerHost, adbServerPort, "host-serial:${it}") }
     }
 
     internal fun readString(inputStream: DataInputStream): String {
@@ -131,7 +144,8 @@ private class AdbServerDadb constructor(
     private val supportedFeatures: Set<String>
 
     init {
-        supportedFeatures = open("host-serial:$name:features").use {
+        supportedFeatures = open("${deviceQuery.replace("host:transport", "host-transport")}:features").use {
+//         supportedFeatures = open("host-serial:$name:features").use { // Fixes more than one device/emulator
             val features = AdbServer.readString(DataInputStream(it.source.inputStream()))
             features.split(",").toSet()
         }
